@@ -1,0 +1,157 @@
+name: Import mod ZIP into a branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "Direct URL to a ZIP asset in a PUBLIC GitHub Release"
+        required: true
+        type: string
+      target_branch:
+        description: "Branch to create/update (keeps main unchanged)"
+        required: true
+        default: "import/missasinfonia-v3-assets"
+        type: string
+      destination_path:
+        description: "Folder inside the repository where extracted files will be stored"
+        required: true
+        default: "mod-source/FNF VS Missasinfonia v3"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: import-mod-zip
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download and validate ZIP
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from urllib.parse import urlparse
+          u = urlparse(os.environ["ZIP_URL"])
+          if u.scheme != "https" or u.netloc.lower() != "github.com" or "/releases/download/" not in u.path:
+              raise SystemExit("Use the direct HTTPS download URL of an asset attached to a public GitHub Release.")
+          PY
+          curl --fail --location --retry 3 --connect-timeout 30 --max-time 1200 "$ZIP_URL" --output "$RUNNER_TEMP/mod.zip"
+          python3 - <<'PY'
+          import os, zipfile
+          p = os.path.join(os.environ["RUNNER_TEMP"], "mod.zip")
+          if not zipfile.is_zipfile(p):
+              raise SystemExit("The downloaded file is not a valid ZIP.")
+          with zipfile.ZipFile(p) as z:
+              infos = z.infolist()
+              files = [x for x in infos if not x.is_dir()]
+              total = sum(x.file_size for x in files)
+              if len(files) > 3000:
+                  raise SystemExit(f"Refusing archive with {len(files)} files; maximum is 3000.")
+              if total > 1024**3:
+                  raise SystemExit(f"Refusing archive with {total} uncompressed bytes; maximum is 1 GiB.")
+              for item in infos:
+                  name = item.filename
+                  if "\\" in name or name.startswith("/") or ".." in name.split("/"):
+                      raise SystemExit(f"Unsafe ZIP path: {name!r}")
+                  mode = (item.external_attr >> 16) & 0o170000
+                  if mode == 0o120000:
+                      raise SystemExit(f"Symbolic links are not allowed in ZIPs: {name!r}")
+                  if not item.is_dir() and item.file_size > 100 * 1024**2:
+                      raise SystemExit(f"File exceeds GitHub's 100 MiB repository limit: {name!r}")
+              print(f"Validated {len(files)} files, {total / 1024**2:.1f} MiB uncompressed.")
+          PY
+
+      - name: Prepare import branch
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git check-ref-format --branch "$TARGET_BRANCH"
+          if [[ "$TARGET_BRANCH" == "main" || "$TARGET_BRANCH" == "master" ]]; then
+            echo "Refusing to import directly into main/master. Choose a separate branch."
+            exit 1
+          fi
+          if git ls-remote --exit-code --heads origin "$TARGET_BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$TARGET_BRANCH"
+            git checkout -B "$TARGET_BRANCH" "origin/$TARGET_BRANCH"
+          else
+            git checkout -b "$TARGET_BRANCH"
+          fi
+
+      - name: Extract ZIP into the destination folder
+        env:
+          DESTINATION_PATH: ${{ inputs.destination_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, shutil, zipfile
+          from pathlib import Path, PurePosixPath
+
+          archive = Path(os.environ["RUNNER_TEMP"]) / "mod.zip"
+          stage = Path(os.environ["RUNNER_TEMP"]) / "mod-unpacked"
+          dest_text = os.environ["DESTINATION_PATH"]
+          dest_rel = PurePosixPath(dest_text)
+          if not dest_text or dest_rel.is_absolute() or ".." in dest_rel.parts or dest_text in (".", "./"):
+              raise SystemExit("Destination must be a safe relative folder path.")
+          if dest_rel.parts[0] in (".git", ".github"):
+              raise SystemExit("Destination cannot overwrite Git internals or workflows.")
+
+          if stage.exists():
+              shutil.rmtree(stage)
+          stage.mkdir(parents=True)
+
+          with zipfile.ZipFile(archive) as z:
+              z.extractall(stage)
+
+          roots = {PurePosixPath(i.filename).parts[0] for i in zipfile.ZipFile(archive).infolist()
+                   if PurePosixPath(i.filename).parts}
+          source = stage
+          if len(roots) == 1:
+              candidate = stage / next(iter(roots))
+              if candidate.is_dir():
+                  source = candidate
+
+          dest = Path.cwd().joinpath(*dest_rel.parts).resolve()
+          workspace = Path.cwd().resolve()
+          if workspace not in dest.parents:
+              raise SystemExit("Destination escaped the repository workspace.")
+
+          if dest.exists():
+              shutil.rmtree(dest)
+          dest.parent.mkdir(parents=True, exist_ok=True)
+          shutil.copytree(source, dest)
+          count = sum(1 for p in dest.rglob("*") if p.is_file())
+          print(f"Imported {count} files into {dest_rel.as_posix()}")
+          PY
+
+      - name: Commit and push imported files
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          DESTINATION_PATH: ${{ inputs.destination_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$DESTINATION_PATH"
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Import FNF mod assets from ZIP"
+          git push origin "$TARGET_BRANCH"
